@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: gex_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_USER: gex_user
+      POSTGRES_PASSWORD: ${DB_PASS:-gex_password_123}
+      POSTGRES_DB: gex_db
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gex_user -d gex_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: gex_backend
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    command: gunicorn --bind 0.0.0.0:5000 app:app
+    expose:
+      - "5000"
+    environment:
+      - DATABASE_URL=postgresql://gex_user:${DB_PASS:-gex_password_123}@db:5432/gex_db
+      - GEXBOT_API_KEY=${GEXBOT_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - gex_net
+
+  scheduler:
+    build: ./backend
+    container_name: gex_scheduler
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    command: python scheduler.py
+    environment:
+      - DATABASE_URL=postgresql://gex_user:${DB_PASS:-gex_password_123}@db:5432/gex_db
+      - GEXBOT_API_KEY=${GEXBOT_API_KEY}
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - gex_net
+
+  frontend:
+    build: ./frontend
+    container_name: gex_frontend
+    ports:
+      - "80:80"
+      - "10001:80"
+    depends_on:
+      - backend
+    networks:
+      - gex_net
+
+volumes:
+  postgres_data:
+
+networks:
+  gex_net:
+    driver: bridge

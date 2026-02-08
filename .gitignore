@@ -1,0 +1,65 @@
+# Credentials and Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.secret
+
+# Node.js
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/pack-report/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.eslintcache
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.pytest_cache/
+**/.venv/
+**/venv/
+**/env/
+**/build/
+**/develop-eggs/
+**/dist/
+**/downloads/
+**/eggs/
+**/.eggs/
+**/lib/
+**/lib64/
+**/parts/
+**/sdist/
+**/var/
+**/wheels/
+**/*.egg-info/
+**/.installed.cfg
+**/*.egg
+
+# Docker & Database
+**/postgres_data/
+**/db_backup/
+
+# Logs
+**/logs/
+**/*.log
+
+# IDE & Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumb.db
+
+*.env
+*.env.local
+*.sql
+*.db
