@@ -63,3 +63,4 @@ Thumb.db
 *.env.local
 *.sql
 *.db
+AGENTS.md

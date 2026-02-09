@@ -69,9 +69,71 @@ gexbot-sentinel/
 
 ## 🔌 API Endpoints
 
-- `GET /api/majors?ticker=SPX`: Major Support/Resistance & Zero Gamma
-- `GET /api/max-change?ticker=SPX`: Significant GEX shifts
-- `GET /api/chain?ticker=SPX`: Full GEX depth profile
+- `GET /api/chain?ticker=SPX`: Full GEX depth profile (includes spot, zero_gamma, major levels, strikes)
+- `GET /api/max-change?ticker=SPX`: Significant GEX shifts per time interval
+
+## ⚡ Quick Deploy (No Docker Rebuild)
+
+For rapid iteration during development, use the dev overlay + deploy script. This avoids rebuilding Docker images entirely.
+
+### One-Time Setup
+
+Switch the running stack to dev mode (adds volume mounts + hot-reload):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+```
+
+This changes three things vs production:
+- **Backend**: Mounts `./backend` into the container + enables gunicorn `--reload` (auto-restarts on `.py` file changes)
+- **Scheduler**: Mounts `./backend` into the container (restart required to pick up changes)
+- **Frontend**: Mounts `./frontend/dist` into nginx (just rebuild + copy)
+
+### Deploy Commands
+
+```bash
+# Deploy frontend only (build locally, copy into container, reload nginx)
+./deploy.sh frontend
+
+# Restart backend (picks up Python changes via volume mount)
+./deploy.sh backend
+
+# Restart scheduler
+./deploy.sh scheduler
+
+# Deploy everything
+./deploy.sh all
+
+# Apply database schema changes to the live DB
+./deploy.sh db-migrate
+```
+
+### How Each Service Updates
+
+| Service | What Happens | Downtime |
+|---------|-------------|----------|
+| **Backend** | gunicorn `--reload` detects `.py` changes automatically via volume mount. Use `./deploy.sh backend` if reload doesn't trigger. | ~1s |
+| **Scheduler** | Requires `./deploy.sh scheduler` (restart) to pick up changes. | ~1s |
+| **Frontend** | `./deploy.sh frontend` runs `npm run build` locally, copies `dist/` into nginx, reloads nginx. | 0s |
+| **Database** | `./deploy.sh db-migrate` runs `database/init.sql` against the live DB. Uses `IF NOT EXISTS` / `IF NOT EXISTS` so it's safe to re-run. | 0s |
+
+### Switching Back to Production Mode
+
+```bash
+docker compose up -d --build
+```
+
+This rebuilds all images from scratch (ignores the dev overlay).
+
+### For AI Agents
+
+When making code changes to this project, **do NOT rebuild Docker images**. Instead:
+
+1. Edit files directly on disk.
+2. **Backend changes** (`backend/*.py`): Auto-detected by gunicorn `--reload` in dev mode. If not, run `./deploy.sh backend`.
+3. **Frontend changes** (`frontend/src/**`): Run `./deploy.sh frontend` (builds + copies + reloads nginx).
+4. **Schema changes** (`database/init.sql`): Run `./deploy.sh db-migrate`. All statements use `IF NOT EXISTS` / `ON CONFLICT` so re-running is safe.
+5. **Verify** at `http://129.146.178.115:10001/`.
 
 ## ⚠️ Troubleshooting
 

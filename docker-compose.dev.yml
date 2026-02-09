@@ -1,0 +1,16 @@
+services:
+  backend:
+    volumes:
+      - ./backend:/app
+    command: gunicorn --bind 0.0.0.0:5000 --reload app:app
+    restart: unless-stopped
+
+  scheduler:
+    volumes:
+      - ./backend:/app
+    command: python scheduler.py
+    restart: unless-stopped
+
+  frontend:
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro

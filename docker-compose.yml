@@ -17,6 +17,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - gex_net
 
   backend:
     build: ./backend
@@ -45,12 +47,13 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 256M
+          memory: 512M
     command: python scheduler.py
     environment:
       - DATABASE_URL=postgresql://gex_user:${DB_PASS:-gex_password_123}@db:5432/gex_db
       - GEXBOT_API_KEY=${GEXBOT_API_KEY}
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
+      - DISCORD_WEBHOOKS=${DISCORD_WEBHOOKS}
     depends_on:
       db:
         condition: service_healthy

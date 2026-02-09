@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, AreaChart, Area, Cell } from 'recharts';
-import { ArrowUpRight, ArrowDownRight, RefreshCcw, Brain, ExternalLink, Activity, Target, Clock, TrendingUp, TrendingDown, Search } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, AreaChart, Area, Cell, Legend } from 'recharts';
+import { ArrowUpRight, ArrowDownRight, RefreshCcw, Brain, ExternalLink, Activity, Target, Clock, TrendingUp, TrendingDown, Search, Pause, Play } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
-import { MockGexResponse, MockGexMajors, MockGexMaxChange, GexApiResponse, GexMajorLevelsResponse, GexMaxChangeResponse } from '../services/mockData';
-import { fetchChain, fetchMajors, fetchMaxChange } from '../services/api';
+import { MockGexResponse, MockGexMaxChange, GexApiResponse, GexMaxChangeResponse } from '../services/mockData';
+import { fetchChain, fetchMaxChange } from '../services/api';
 import { History3DChart } from './History3DChart';
 
 // Initialize GenAI client safely - checking for env var in a real app
@@ -27,18 +27,31 @@ const formatCompact = (value: number) => {
   return new Intl.NumberFormat('en-US', { notation: "compact", maximumFractionDigits: 1 }).format(value);
 };
 
-const QUICK_TICKERS = ["AAPL", "AMD", "AMZN", "COIN", "GLD", "GOOG", "GOOGL", "INTC", "IWM", "META", "MSFT", "MSTR", "MU", "NFLX", "NVDA", "PLTR", "QQQ", "SLV", "SOFT", "SPX", "SPY", "TLT", "TSLA", "TSM", "UNH"];
+// Scale values proportionally to max, preserving relative magnitudes
+// Max value becomes the cap, others scale proportionally
+const scaleToMax = (values: number[]): { scaled: number[]; maxAbs: number } => {
+  if (values.length === 0) return { scaled: [], maxAbs: 1 };
+  const maxAbs = Math.max(...values.map(Math.abs), 1);
+  const scaled = values.map(v => v / maxAbs * 100); // Scale to -100 to 100 range
+  return { scaled, maxAbs };
+};
+
+const QUICK_TICKERS = ["AAPL", "AMD", "AMZN", "COIN", "GLD", "GOOG", "GOOGL", "INTC", "IWM", "META", "MSFT", "MSTR", "MU", "NFLX", "NVDA", "PLTR", "QQQ", "SLV", "SOFI", "SPX", "SPY", "TLT", "TSLA", "TSM", "UNH"];
 
 export const Dashboard: React.FC = () => {
   const [selectedTicker, setSelectedTicker] = useState<string>('SPX');
   const [customTicker, setCustomTicker] = useState('');
   const [apiData, setApiData] = useState<GexApiResponse>(MockGexResponse);
-  const [majorLevels, setMajorLevels] = useState<GexMajorLevelsResponse>(MockGexMajors);
   const [maxChange, setMaxChange] = useState<GexMaxChangeResponse>(MockGexMaxChange);
   const [loading, setLoading] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [refreshInterval, setRefreshInterval] = useState(600000);
   const userRole = sessionStorage.getItem('userRole') || 'viewer';
+
+  // Debug logs for API calls
+  const [debugLogs, setDebugLogs] = useState<Array<{type: 'gexbot' | 'llm', status: 'success' | 'error', message: string, timestamp: Date}>>([]);
 
   // Custom LLM Overrides
   const [useCustomLLM, setUseCustomLLM] = useState(false);
@@ -46,51 +59,71 @@ export const Dashboard: React.FC = () => {
   const [customLLMBase, setCustomLLMBase] = useState('');
   const [customLLMModel, setCustomLLMModel] = useState('');
 
-  // Transform raw strike data for the chart
-  const chartData = useMemo(() => {
-    return apiData.strikes.map((s) => {
-      const strike = s[0] as number;
-      const gexVol = s[1] as number; // Net GEX by Volume
-      const gexOi = s[2] as number;  // Net GEX by OI
-      return {
-        strike,
-        netGex: gexVol,
-        netGexOi: gexOi,
-      };
-    });
+  const addDebugLog = (type: 'gexbot' | 'llm', status: 'success' | 'error', message: string) => {
+    setDebugLogs(prev => [{type, status, message, timestamp: new Date()}, ...prev].slice(0, 50));
+  };
+
+  // Transform raw strike data for the chart with proportional scaling
+  const { chartData, maxVolAbs, maxOiAbs } = useMemo(() => {
+    const raw = apiData.strikes.map((s) => ({
+      strike: Math.round(s[0] as number), // Round to integer
+      netGex: s[1] as number,
+      netGexOi: s[2] as number,
+    }));
+    
+    // Scale GEX values proportionally to max (preserves relative magnitudes)
+    const volValues = raw.map(d => d.netGex);
+    const oiValues = raw.map(d => d.netGexOi);
+    const { scaled: scaledVol, maxAbs: maxVolAbs } = scaleToMax(volValues);
+    const { scaled: scaledOi, maxAbs: maxOiAbs } = scaleToMax(oiValues);
+    
+    const scaled = raw.map((d, i) => ({
+      ...d,
+      scaledGex: scaledVol[i],
+      scaledGexOi: scaledOi[i],
+    }));
+    return { chartData: scaled, maxVolAbs, maxOiAbs };
   }, [apiData]);
 
-  // Calculate Chart Axis Domain based on Spot Price: [Spot-50, Spot+50]
+  // Calculate Chart Axis Domain: round to nearest 10 for grid alignment
   const chartDomain = useMemo(() => {
-    const spot = majorLevels.spot;
-    return [Math.floor(spot - 50), Math.ceil(spot + 50)];
-  }, [majorLevels.spot]);
+    const spot = apiData.spot;
+    if (!spot || spot === 0) return [0, 1];
+    const lower = Math.floor(spot * 0.99 / 10) * 10;
+    const upper = Math.ceil(spot * 1.01 / 10) * 10;
+    return [lower, upper];
+  }, [apiData]);
 
-  // Fetch live data from API
-  const refreshData = async () => {
+  // Fetch live data from API (2 calls: chain + maxchange)
+  const refreshData = useCallback(async () => {
     setLoading(true);
     try {
-      const [newMajors, newMaxChange, newChain] = await Promise.all([
-        fetchMajors(selectedTicker),
-        fetchMaxChange(selectedTicker),
-        fetchChain(selectedTicker)
+      const [newChain, newMaxChange] = await Promise.all([
+        fetchChain(selectedTicker),
+        fetchMaxChange(selectedTicker)
       ]);
 
-      setMajorLevels(newMajors);
-      setMaxChange(newMaxChange);
       setApiData(newChain);
+      setMaxChange(newMaxChange);
+      addDebugLog('gexbot', 'success', `Fetched ${selectedTicker} - Spot: ${newChain.spot}, Strikes: ${newChain.strikes.length}`);
     } catch (err) {
       console.error("Failed to fetch data:", err);
+      addDebugLog('gexbot', 'error', `Failed to fetch ${selectedTicker}: ${err}`);
     } finally {
       setLoading(false);
     }
-  };
+  }, [selectedTicker]);
 
+  // Always fetch immediately on ticker change; auto-refresh on interval if enabled
   useEffect(() => {
     refreshData();
-    const interval = setInterval(refreshData, 60000); // Poll every minute
+  }, [refreshData]);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(refreshData, refreshInterval);
     return () => clearInterval(interval);
-  }, [selectedTicker]);
+  }, [autoRefresh, refreshInterval, refreshData]);
 
   const handleCustomTickerSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,15 +148,15 @@ export const Dashboard: React.FC = () => {
     setAnalyzing(true);
     try {
       const context = `
-        Asset: ${majorLevels.ticker}
-        Spot Price: ${majorLevels.spot}
-        Zero Gamma Level (Flip): ${majorLevels.zero_gamma}
-        Major Resistance via Positive Gamma Change (Vol): ${majorLevels.mpos_vol}
-        Major Support via Negative Gamma Change (Vol): ${majorLevels.mneg_vol}
-        Major Positive Gamma (OI): ${majorLevels.mpos_oi}
-        Major Negative Gamma (OI): ${majorLevels.mneg_oi}
-        Net Gamma Exposure (Vol): ${majorLevels.net_gex_vol}
-        Net Gamma Exposure (OI): ${majorLevels.net_gex_oi}
+        Asset: ${apiData.ticker}
+        Spot Price: ${apiData.spot}
+        Zero Gamma Level (Flip): ${apiData.zero_gamma}
+        Major Resistance via Positive Gamma Change (Vol): ${apiData.major_pos_vol}
+        Major Support via Negative Gamma Change (Vol): ${apiData.major_neg_vol}
+        Major Positive Gamma (OI): ${apiData.major_pos_oi}
+        Major Negative Gamma (OI): ${apiData.major_neg_oi}
+        Net Gamma Exposure (Vol): ${apiData.sum_gex_vol}
+        Net Gamma Exposure (OI): ${apiData.sum_gex_oi}
         Max Change (Current): Strike ${maxChange.current[0]} Value ${maxChange.current[1]}
       `;
 
@@ -178,9 +211,11 @@ export const Dashboard: React.FC = () => {
       }
 
       setAiAnalysis(resultText);
+      addDebugLog('llm', 'success', `Analysis generated (${effectiveModel || 'default'})`);
     } catch (error) {
       console.error("Analysis failed", error);
       setAiAnalysis("Error generating analysis. Please check API Key and Base URL configuration.");
+      addDebugLog('llm', 'error', `Analysis failed: ${error}`);
     } finally {
       setAnalyzing(false);
     }
@@ -233,32 +268,57 @@ export const Dashboard: React.FC = () => {
           />
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
         </form>
+
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={() => setAutoRefresh(!autoRefresh)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+              autoRefresh
+                ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                : 'bg-gray-800 text-gray-500 border border-gray-700'
+            }`}
+          >
+            {autoRefresh ? <Play size={12} /> : <Pause size={12} />}
+            {autoRefresh ? 'Auto' : 'Paused'}
+          </button>
+            <select
+            value={refreshInterval}
+            onChange={(e) => setRefreshInterval(Number(e.target.value))}
+            className="bg-gray-950 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-gray-300 focus:outline-none focus:border-emerald-500"
+          >
+            <option value={60000}>1min</option>
+            <option value={300000}>5min</option>
+            <option value={600000}>10min</option>
+            <option value={900000}>15min</option>
+            <option value={1800000}>30min</option>
+          </select>
+        </div>
       </div>
 
       {/* Stats Row */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <StatCard
           title="Net GEX (Vol)"
-          value={formatNumber(majorLevels.net_gex_vol)}
-          change={majorLevels.net_gex_vol > 0 ? "Long Gamma" : "Short Gamma"}
-          positive={majorLevels.net_gex_vol > 0}
+          value={formatNumber(apiData.sum_gex_vol)}
+          change={apiData.sum_gex_vol > 0 ? "Long Gamma" : "Short Gamma"}
+          positive={apiData.sum_gex_vol > 0}
         />
         <StatCard
           title="Zero Gamma"
-          value={majorLevels.zero_gamma.toFixed(2)}
+          value={apiData.zero_gamma.toFixed(2)}
           change={`Pivot Level`}
-          positive={majorLevels.spot > majorLevels.zero_gamma}
+          positive={apiData.spot > apiData.zero_gamma}
           icon={<Activity size={16} />}
         />
         <StatCard
           title="Major Res (Vol)"
-          value={majorLevels.mpos_vol.toFixed(2)}
+          value={apiData.major_pos_vol.toFixed(2)}
           change="Call Wall"
           positive={true}
         />
         <StatCard
           title="Major Supp (Vol)"
-          value={majorLevels.mneg_vol.toFixed(2)}
+          value={apiData.major_neg_vol.toFixed(2)}
           change="Put Wall"
           positive={false}
         />
@@ -286,28 +346,28 @@ export const Dashboard: React.FC = () => {
               {/* Spot */}
               <div>
                 <span className="block text-gray-500 mb-0.5 font-medium">Spot</span>
-                <span className="text-yellow-500 font-mono font-bold text-sm">{majorLevels.spot.toFixed(2)}</span>
+                <span className="text-yellow-500 font-mono font-bold text-sm">{apiData.spot.toFixed(2)}</span>
               </div>
 
               {/* Zero Gamma */}
               <div>
                 <span className="block text-gray-500 mb-0.5 font-medium">Zero Gamma</span>
-                <span className="text-purple-400 font-mono font-bold">{majorLevels.zero_gamma.toFixed(2)}</span>
+                <span className="text-purple-400 font-mono font-bold">{apiData.zero_gamma.toFixed(2)}</span>
               </div>
 
               {/* Net Vol */}
               <div>
                 <span className="block text-gray-500 mb-0.5 font-medium">Net Vol</span>
-                <span className={`font-mono font-bold ${majorLevels.net_gex_vol >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {formatNumber(majorLevels.net_gex_vol)}
+                <span className={`font-mono font-bold ${apiData.sum_gex_vol >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {formatNumber(apiData.sum_gex_vol)}
                 </span>
               </div>
 
               {/* Net OI */}
               <div>
                 <span className="block text-gray-500 mb-0.5 font-medium">Net OI</span>
-                <span className={`font-mono font-bold ${majorLevels.net_gex_oi >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {formatNumber(majorLevels.net_gex_oi)}
+                <span className={`font-mono font-bold ${apiData.sum_gex_oi >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {formatNumber(apiData.sum_gex_oi)}
                 </span>
               </div>
 
@@ -315,7 +375,7 @@ export const Dashboard: React.FC = () => {
               <div className="col-span-1 sm:col-span-2 lg:col-span-1">
                 <span className="block text-gray-500 mb-0.5 font-medium">Max Pos (Vol / OI)</span>
                 <div className="font-mono text-emerald-400">
-                  {majorLevels.mpos_vol} <span className="text-gray-600">/</span> {majorLevels.mpos_oi}
+                  {apiData.major_pos_vol} <span className="text-gray-600">/</span> {apiData.major_pos_oi}
                 </div>
               </div>
 
@@ -323,7 +383,7 @@ export const Dashboard: React.FC = () => {
               <div className="col-span-1 sm:col-span-2 lg:col-span-1">
                 <span className="block text-gray-500 mb-0.5 font-medium">Max Neg (Vol / OI)</span>
                 <div className="font-mono text-red-400">
-                  {majorLevels.mneg_vol} <span className="text-gray-600">/</span> {majorLevels.mneg_oi}
+                  {apiData.major_neg_vol} <span className="text-gray-600">/</span> {apiData.major_neg_oi}
                 </div>
               </div>
 
@@ -349,7 +409,7 @@ export const Dashboard: React.FC = () => {
                   data={chartData}
                   margin={{ top: 20, right: 30, left: 40, bottom: 5 }}
                 >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.2} horizontal={true} vertical={true} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#4b5563" opacity={0.5} horizontal={true} vertical={true} />
                   <XAxis type="number" stroke="#9ca3af" tick={{ fill: '#9ca3af', fontSize: 10 }} />
                   <YAxis
                     dataKey="strike"
@@ -358,16 +418,16 @@ export const Dashboard: React.FC = () => {
                     allowDataOverflow={true}
                     stroke="#9ca3af"
                     tick={{ fill: '#9ca3af', fontSize: 11 }}
-                    tickCount={10}
+                    tickCount={15}
                     label={{ value: 'Strike', angle: -90, position: 'insideLeft', fill: '#6b7280' }}
                     reversed={true}
                   />
                   <Tooltip content={<CustomTooltip mode="vol" />} cursor={{ fill: '#ffffff', opacity: 0.05 }} />
                   <ReferenceLine x={0} stroke="#4b5563" />
-                  <ReferenceLine y={majorLevels.spot} stroke="#f59e0b" strokeWidth={2} label={{ value: 'SPOT', fill: '#f59e0b', fontSize: 10 }} />
-                  <Bar dataKey="netGex" barSize={10}>
+                  <ReferenceLine y={apiData.spot} stroke="#f59e0b" strokeWidth={2} label={{ value: 'SPOT', fill: '#f59e0b', fontSize: 10 }} />
+                  <Bar dataKey="scaledGex" barSize={10}>
                     {chartData.map((entry, index) => (
-                      <Cell key={`cell-vol-${index}`} fill={entry.netGex > 0 ? '#10b981' : '#ef4444'} />
+                      <Cell key={`cell-vol-${index}`} fill={entry.scaledGex > 0 ? '#10b981' : '#ef4444'} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -383,7 +443,7 @@ export const Dashboard: React.FC = () => {
                   data={chartData}
                   margin={{ top: 20, right: 10, left: 10, bottom: 5 }}
                 >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.2} horizontal={true} vertical={true} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#4b5563" opacity={0.5} horizontal={true} vertical={true} />
                   <XAxis type="number" stroke="#9ca3af" tick={{ fill: '#9ca3af', fontSize: 10 }} />
                   <YAxis
                     dataKey="strike"
@@ -395,10 +455,10 @@ export const Dashboard: React.FC = () => {
                   />
                   <Tooltip content={<CustomTooltip mode="oi" />} cursor={{ fill: '#ffffff', opacity: 0.05 }} />
                   <ReferenceLine x={0} stroke="#4b5563" />
-                  <ReferenceLine y={majorLevels.spot} stroke="#f59e0b" strokeWidth={2} />
-                  <Bar dataKey="netGexOi" barSize={10}>
+                  <ReferenceLine y={apiData.spot} stroke="#f59e0b" strokeWidth={2} />
+                  <Bar dataKey="scaledGexOi" barSize={10}>
                     {chartData.map((entry, index) => (
-                      <Cell key={`cell-oi-${index}`} fill={entry.netGexOi > 0 ? '#10b981' : '#ef4444'} />
+                      <Cell key={`cell-oi-${index}`} fill={entry.scaledGexOi > 0 ? '#10b981' : '#ef4444'} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -514,16 +574,33 @@ export const Dashboard: React.FC = () => {
         </div>
       </div>
 
-      {/* 3D History Chart Row */}
-      <div className="md:col-span-1 lg:col-span-3">
-        <History3DChart apiData={apiData} spotPrice={majorLevels.spot} />
-      </div>
-
-      {/* Secondary Charts Row */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-          <h3 className="text-md font-semibold text-gray-200 mb-4">Gex Trend & Major Pivots</h3>
-          <div className="h-48 w-full">
+      {/* Bottom Row: Three panels */}
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
+        {/* Panel 1: GEX Trend & Major Pivots */}
+        <div className="md:col-span-2 bg-gray-900 border border-gray-800 rounded-xl p-6">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-md font-semibold text-gray-200">GEX Trend & Major Pivots</h3>
+            {/* Manual Legend */}
+            <div className="flex items-center gap-3 text-[10px]">
+              <div className="flex items-center gap-1">
+                <div className="w-3 h-3 bg-purple-400 rounded-sm"></div>
+                <span className="text-gray-400">Net GEX</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-4 h-0.5 bg-yellow-500"></div>
+                <span className="text-gray-400">SPOT</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-4 h-0.5 bg-emerald-500 border-dashed" style={{borderTop: '1px dashed #10b981'}}></div>
+                <span className="text-gray-400">Res</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-4 h-0.5 bg-red-500 border-dashed" style={{borderTop: '1px dashed #ef4444'}}></div>
+                <span className="text-gray-400">Supp</span>
+              </div>
+            </div>
+          </div>
+          <div className="h-[300px] w-full">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chartData}>
                 <defs>
@@ -532,50 +609,54 @@ export const Dashboard: React.FC = () => {
                     <stop offset="95%" stopColor="#8884d8" stopOpacity={0} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.2} />
-                {/* Ensure XAxis is numeric and covers the range to correctly position reference lines */}
-                <XAxis dataKey="strike" type="number" hide domain={['dataMin', 'dataMax']} />
-                <YAxis hide />
-                <Tooltip content={<CustomTooltip />} />
+                <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
+                <XAxis dataKey="strike" type="number" domain={chartDomain} allowDataOverflow={true} stroke="#6b7280" tick={{ fill: '#9ca3af', fontSize: 10 }} />
+                <YAxis 
+                  stroke="#6b7280" 
+                  tick={{ fill: '#9ca3af', fontSize: 10 }}
+                  domain={[-110, 110]}
+                  allowDataOverflow={true}
+                />
+                <Tooltip content={<CustomTooltip mode="vol" />} />
                 <ReferenceLine y={0} stroke="#4b5563" />
-
-                {/* Major Level Pivots are now here for easier identification */}
-                <ReferenceLine x={majorLevels.spot} stroke="#f59e0b" strokeWidth={2} label={{ value: 'SPOT', fill: '#f59e0b', fontSize: 10, position: 'insideTop' }} />
-                <ReferenceLine x={majorLevels.zero_gamma} stroke="#a855f7" strokeDasharray="5 5" label={{ value: 'Zero G', fill: '#a855f7', fontSize: 10, position: 'insideTop' }} />
-                <ReferenceLine x={majorLevels.mpos_vol} stroke="#10b981" strokeDasharray="3 3" label={{ value: 'Res', fill: '#10b981', fontSize: 10, position: 'insideTop' }} />
-                <ReferenceLine x={majorLevels.mneg_vol} stroke="#ef4444" strokeDasharray="3 3" label={{ value: 'Supp', fill: '#ef4444', fontSize: 10, position: 'insideTop' }} />
-
-                <Area type="monotone" dataKey="netGex" stroke="#8884d8" fillOpacity={1} fill="url(#colorNet)" />
+                <ReferenceLine x={apiData.spot} stroke="#f59e0b" strokeWidth={2} />
+                <ReferenceLine x={apiData.major_pos_vol} stroke="#10b981" strokeWidth={2} strokeDasharray="8 4" />
+                <ReferenceLine x={apiData.major_neg_vol} stroke="#ef4444" strokeWidth={2} strokeDasharray="8 4" />
+                <Area type="monotone" dataKey="scaledGex" stroke="#8884d8" fillOpacity={1} fill="url(#colorNet)" name="Net GEX" />
               </AreaChart>
             </ResponsiveContainer>
           </div>
         </div>
 
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 flex flex-col justify-between">
-          <div>
-            <h3 className="text-md font-semibold text-gray-200 mb-2">Oracle Cloud ARM64 Status</h3>
-            <div className="flex items-center gap-2 mb-6">
-              <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-              <span className="text-sm text-gray-400">Instance: ocid1...ampere.a1 (Running)</span>
-            </div>
-          </div>
+        {/* Panel 2: Historical GEX Surface */}
+        <div className="md:col-span-2">
+          <History3DChart apiData={apiData} />
+        </div>
 
-          <div className="space-y-3">
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-500">OCPU Usage (4 Cores)</span>
-              <span className="text-gray-300">22%</span>
-            </div>
-            <div className="w-full bg-gray-800 rounded-full h-1.5">
-              <div className="bg-emerald-500 h-1.5 rounded-full" style={{ width: '22%' }}></div>
-            </div>
-
-            <div className="flex justify-between text-sm mt-2">
-              <span className="text-gray-500">RAM (24GB)</span>
-              <span className="text-gray-300">4.1GB / 24GB</span>
-            </div>
-            <div className="w-full bg-gray-800 rounded-full h-1.5">
-              <div className="bg-blue-500 h-1.5 rounded-full" style={{ width: '17%' }}></div>
-            </div>
+        {/* Panel 3: Real-Time API Calling */}
+        <div className="md:col-span-1 bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <h3 className="text-sm font-semibold text-gray-200 mb-3">Real-Time API Calling</h3>
+          <div className="h-[300px] overflow-y-auto space-y-2">
+            {debugLogs.length === 0 ? (
+              <p className="text-gray-500 text-xs italic">No API calls yet...</p>
+            ) : (
+              debugLogs.map((log, idx) => (
+                <div key={idx} className="text-xs border-l-2 pl-2 py-1" style={{
+                  borderLeftColor: log.status === 'success' ? '#10b981' : '#ef4444'
+                }}>
+                  <div className="flex items-center gap-2">
+                    <span className={`font-medium ${log.type === 'gexbot' ? 'text-blue-400' : 'text-purple-400'}`}>
+                      {log.type.toUpperCase()}
+                    </span>
+                    <span className={log.status === 'success' ? 'text-emerald-400' : 'text-red-400'}>
+                      {log.status.toUpperCase()}
+                    </span>
+                  </div>
+                  <p className="text-gray-400 mt-0.5">{log.message}</p>
+                  <p className="text-gray-600 text-[10px]">{log.timestamp.toLocaleTimeString()}</p>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>

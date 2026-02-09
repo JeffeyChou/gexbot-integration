@@ -5,9 +5,8 @@ import os
 import schedule
 import json
 import logging
-from datetime import datetime
+from dashboard_image import generate_and_send
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -16,73 +15,71 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("GEXBOT_API_KEY")
 DB_URL = os.getenv("DATABASE_URL")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-HEADERS = {"User-Agent": "GexbotSentinel/1.0", "Accept": "application/json"}
+DISCORD_WEBHOOKS = [
+    url.strip() for url in os.getenv("DISCORD_WEBHOOKS", os.getenv("DISCORD_WEBHOOK", "")).split(",") if url.strip()
+]
+HEADERS = {"User-Agent": "GexbotSentinel/Scheduler/1.0", "Accept": "application/json"}
+
+AGGREGATION = "zero"
+SCHEDULER_TICKERS = os.getenv("SCHEDULER_TICKERS", "SPX,SPY,QQQ,IWM").split(",")
 
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
 def send_discord_alert(message):
-    if not DISCORD_WEBHOOK:
+    if not DISCORD_WEBHOOKS:
         return
-    try:
-        payload = {"content": message}
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"Failed to send Discord alert: {e}")
+    for webhook_url in DISCORD_WEBHOOKS:
+        try:
+            requests.post(webhook_url, json={"content": message}, timeout=5)
+        except Exception as e:
+            logger.error(f"Discord alert failed for {webhook_url[:60]}: {e}")
 
-def fetch_gex_majors():
-    logger.info("Fetching Gex Majors...")
+def cache_chain_data(ticker, data):
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        url = f"https://api.gexbot.com/SPX/classic/full/majors?key={API_KEY}"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        if resp.status_code != 200:
-            error_msg = f"Failed to fetch majors: {resp.status_code} - {resp.text}"
-            logger.error(error_msg)
-            send_discord_alert(f"⚠️ Gexbot Error: {error_msg}")
-            return
-        data = resp.json()
-
-        conn = get_db_connection()
-        cur = conn.cursor()
         cur.execute("""
-            INSERT INTO gex_major_levels 
+            INSERT INTO gex_snapshots
+            (timestamp, ticker, spot_price, sum_gex_vol, strikes_data, full_data)
+            VALUES (to_timestamp(%s), %s, %s, %s, %s, %s)
+            ON CONFLICT (ticker, timestamp) DO NOTHING
+        """, (
+            data.get('timestamp'), ticker, data.get('spot'),
+            data.get('sum_gex_vol'), json.dumps(data.get('strikes', [])),
+            json.dumps(data)
+        ))
+        cur.execute("""
+            INSERT INTO gex_major_levels
             (timestamp, ticker, spot, zero_gamma, mpos_vol, mpos_oi, mneg_vol, mneg_oi, net_gex_vol, net_gex_oi)
             VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ticker, timestamp) DO NOTHING
         """, (
-            data.get('timestamp'), data.get('ticker'), data.get('spot'),
-            data.get('zero_gamma'), data.get('mpos_vol'), data.get('mpos_oi'),
-            data.get('mneg_vol'), data.get('mneg_oi'), 
-            data.get('net_gex_vol'), data.get('net_gex_oi')
+            data.get('timestamp'), ticker, data.get('spot'),
+            data.get('zero_gamma'), data.get('major_pos_vol'), data.get('major_pos_oi'),
+            data.get('major_neg_vol'), data.get('major_neg_oi'),
+            data.get('sum_gex_vol'), data.get('sum_gex_oi')
         ))
         conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"DB cache chain failed for {ticker}: {e}")
+    finally:
         cur.close()
         conn.close()
-        logger.info("Majors saved successfully.")
-    except Exception as e:
-        logger.exception(f"Error in fetch_gex_majors: {e}")
-        send_discord_alert(f"🚨 Scheduler Exception (Majors): {e}")
 
-def fetch_gex_max_change():
-    logger.info("Fetching Gex Max Change...")
+def cache_maxchange_data(ticker, data):
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        url = f"https://api.gexbot.com/SPX/classic/full/maxchange?key={API_KEY}"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        if resp.status_code != 200:
-            error_msg = f"Failed to fetch max change: {resp.status_code} - {resp.text}"
-            logger.error(error_msg)
-            send_discord_alert(f"⚠️ Gexbot Error: {error_msg}")
-            return
-        data = resp.json()
-
-        conn = get_db_connection()
-        cur = conn.cursor()
         cur.execute("""
-            INSERT INTO gex_max_change 
-            (timestamp, ticker, current_strike, current_val, one_min_strike, one_min_val, five_min_strike, five_min_val, thirty_min_strike, thirty_min_val, full_data)
+            INSERT INTO gex_max_change
+            (timestamp, ticker, current_strike, current_val, one_min_strike, one_min_val,
+             five_min_strike, five_min_val, thirty_min_strike, thirty_min_val, full_data)
             VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ticker, timestamp) DO NOTHING
         """, (
-            data.get('timestamp'), data.get('ticker'), 
+            data.get('timestamp'), ticker,
             data['current'][0], data['current'][1],
             data['one'][0], data['one'][1],
             data['five'][0], data['five'][1],
@@ -90,63 +87,63 @@ def fetch_gex_max_change():
             json.dumps(data)
         ))
         conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"DB cache maxchange failed for {ticker}: {e}")
+    finally:
         cur.close()
         conn.close()
-        logger.info("Max Change saved successfully.")
-    except Exception as e:
-        logger.exception(f"Error in fetch_gex_max_change: {e}")
-        send_discord_alert(f"🚨 Scheduler Exception (Max Change): {e}")
 
-def fetch_gex_chain():
-    logger.info("Fetching Gex Chain...")
+def fetch_and_cache_ticker(ticker):
+    logger.info(f"Scheduler: fetching {ticker} data...")
+    chain_data = None
+    maxchange_data = None
     try:
-        url = f"https://api.gexbot.com/SPX/classic/zero?key={API_KEY}"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        if resp.status_code != 200:
-            error_msg = f"Failed to fetch chain: {resp.status_code} - {resp.text}"
-            logger.error(error_msg)
-            send_discord_alert(f"⚠️ Gexbot Error: {error_msg}")
-            return
-        data = resp.json()
+        chain_url = f"https://api.gexbot.com/{ticker}/classic/{AGGREGATION}?key={API_KEY}"
+        resp = requests.get(chain_url, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            chain_data = resp.json()
+            cache_chain_data(ticker, chain_data)
+            logger.info(f"{ticker} chain cached.")
+        else:
+            logger.error(f"{ticker} chain fetch failed: {resp.status_code}")
+            send_discord_alert(f"⚠️ {ticker} chain error: {resp.status_code}")
 
-        strikes = data.get('strikes', [])
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO gex_snapshots 
-            (timestamp, ticker, spot_price, sum_gex_vol, strikes_data)
-            VALUES (to_timestamp(%s), %s, %s, %s, %s)
-        """, (
-            data.get('timestamp'), data.get('ticker'), data.get('spot'),
-            data.get('sum_gex_vol'), json.dumps(strikes)
-        ))
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info("Chain saved successfully.")
+        mc_url = f"https://api.gexbot.com/{ticker}/classic/{AGGREGATION}/maxchange?key={API_KEY}"
+        resp = requests.get(mc_url, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            maxchange_data = resp.json()
+            cache_maxchange_data(ticker, maxchange_data)
+            logger.info(f"{ticker} maxchange cached.")
+        else:
+            logger.error(f"{ticker} maxchange fetch failed: {resp.status_code}")
+            send_discord_alert(f"⚠️ {ticker} maxchange error: {resp.status_code}")
+
     except Exception as e:
-        logger.exception(f"Error in fetch_gex_chain: {e}")
-        send_discord_alert(f"🚨 Scheduler Exception (Chain): {e}")
+        logger.exception(f"Scheduler {ticker} error: {e}")
+        send_discord_alert(f"🚨 Scheduler Exception ({ticker}): {e}")
+
+    return chain_data, maxchange_data
+
+def fetch_cache_and_generate():
+    for ticker in SCHEDULER_TICKERS:
+        chain_data, maxchange_data = fetch_and_cache_ticker(ticker)
+        if chain_data and maxchange_data:
+            for webhook_url in DISCORD_WEBHOOKS:
+                generate_and_send(chain_data, maxchange_data, webhook_url, ticker=ticker)
 
 if __name__ == "__main__":
     if not API_KEY:
-        logger.warning("GEXBOT_API_KEY is not set. Scheduler may fail.")
+        logger.warning("GEXBOT_API_KEY not set. Scheduler may fail.")
     if not DB_URL:
-        logger.error("DATABASE_URL is not set. Exiting.")
+        logger.error("DATABASE_URL not set. Exiting.")
         exit(1)
 
-    logger.info("Scheduler started. Running initial fetch...")
-    send_discord_alert("✅ Gexbot Sentinel Scheduler Started on Oracle ARM64")
-    # Run once on startup
-    fetch_gex_majors()
-    fetch_gex_max_change()
-    fetch_gex_chain()
+    logger.info(f"Scheduler started. Tickers: {SCHEDULER_TICKERS}. Initial fetch...")
+    send_discord_alert(f"✅ Gexbot Sentinel Scheduler Started — Tickers: {', '.join(SCHEDULER_TICKERS)}")
+    fetch_cache_and_generate()
 
-    # Schedule every 5 minutes
-    schedule.every(5).minutes.do(fetch_gex_majors)
-    schedule.every(5).minutes.do(fetch_gex_max_change)
-    schedule.every(5).minutes.do(fetch_gex_chain)
+    schedule.every(5).minutes.do(fetch_cache_and_generate)
 
     while True:
         schedule.run_pending()

@@ -21,19 +21,7 @@ export interface GexApiResponse {
   delta_risk_reversal: number;
   strikes: (number | number[])[][]; // [strike, gex_vol, gex_oi, priors[]]
   max_priors: (number | number[])[][];
-}
-
-export interface GexMajorLevelsResponse {
-  zero_gamma: number;
-  mpos_vol: number;
-  mpos_oi: number;
-  mneg_vol: number;
-  mneg_oi: number;
-  net_gex_vol: number;
-  net_gex_oi: number;
-  timestamp: number;
-  ticker: string;
-  spot: number;
+  spot_priors?: number[]; // Historical spot prices [-30m, -15m, -10m, -5m, -1m, current]
 }
 
 export interface GexMaxChangeResponse {
@@ -58,19 +46,6 @@ export const MockGexMaxChange: GexMaxChangeResponse = {
   "thirty": [6930, -752886.495]
 };
 
-export const MockGexMajors: GexMajorLevelsResponse = {
-  "zero_gamma": 6930.27,
-  "mpos_vol": 6923.39,
-  "mpos_oi": 6922.5,
-  "mneg_vol": 6930,
-  "mneg_oi": 6930,
-  "net_gex_vol": -405318.916,
-  "net_gex_oi": -51271.351,
-  "timestamp": 1770411600,
-  "ticker": "SPX",
-  "spot": 6930.27
-};
-
 export const MockGexResponse: GexApiResponse = {
   "timestamp": 1770411600,
   "ticker": "SPX",
@@ -86,6 +61,7 @@ export const MockGexResponse: GexApiResponse = {
   "sum_gex_oi": -51271.351,
   "delta_risk_reversal": -0.05,
   "max_priors": [],
+  "spot_priors": [6915.5, 6920.3, 6925.8, 6928.1, 6929.5, 6930.27],
   "strikes": [
     [6690, -10.36, -3.82, 0],
     [6695, -9.05, -7.83, -8.19],
